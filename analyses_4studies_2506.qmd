@@ -1,0 +1,1065 @@
+---
+title: "A Bayesian Approach to Change Point Estimation in Protein Requirements Using Indicator Amino Acid Oxidation Method"
+author: 
+  - Shuntaro Sato
+date: now
+date-format: "YYYY/MM/DD, HH:mm"
+format:
+    html:
+      embed-resources: true
+      code-fold: true
+      code-line-numbers: true
+      toc: true
+      toc-depth: 3
+      number-sections: true
+---
+
+# Set up
+## Packages
+
+```{r}
+#| output: false
+library(tidyverse)
+library(here)
+library(nlme)  # Mixed effect model
+library(rstan)
+library(bayesplot)
+library(patchwork)
+library(gt)
+
+here::i_am("04_Script/analyses_4studies_2506.qmd")
+
+# Stan設定
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+```
+
+## Import dataset
+
+For Rafii ID5 protein quantity 0.4, there were two values (0.75, 0.8), but the average value was adopted.
+
+```{r}
+ds00 <- read_rds(here("01_Data/ds_4studies.rds"))
+```
+
+
+# Functions
+## Plot
+### Plot for indivisual
+```{r}
+plot_individual <- function(data, manuscript) {
+  ggplot(data, aes(x = protein, y = outcome)) +
+    geom_point() +
+    geom_line() +
+    scale_y_continuous(limits = c(0, max(data$outcome) * 1.1)) +
+    labs(title = manuscript,
+         y = expression(" "^{"13"}~CO[2]),
+         x = "Protein intake per day [g/kg]") +
+    theme_bw() +
+    theme(panel.grid.minor = element_blank()) +
+    facet_wrap(~id, ncol = 5)
+}
+```
+
+### Plot for mixed-effects model
+```{r}
+plot_mixed_model <- function(data, model_result, manuscript, random_slope = FALSE) {
+  x_cp <- model_result$cut_point
+  
+  # Preparation dataset
+  ds_model <- data %>%
+    mutate(id = fct_drop(id),
+           X = I(protein < x_cp) * (protein - x_cp))
+  
+  # Estimate model
+  if (random_slope) {
+    model <- lme(outcome ~ X, data = ds_model, random = ~ X|id, 
+                 control = lmeControl(opt = 'optim'))
+  } else {
+    model <- lme(outcome ~ X, data = ds_model, random = ~ 1|id)
+  }
+  
+  # Create predicted data
+  id_d <- unique(ds_model$id)
+  protein_max <- max(data$protein)
+  
+  ds_pred <- expand_grid(id = id_d, protein = seq(0.2, protein_max, by = 0.01)) %>% 
+    mutate(X = I(protein < x_cp) * (protein - x_cp))
+  
+  pred_results <- predict(model, newdata = ds_pred, level = 0:1)
+  
+  # Predict individual
+  ds_pred_ind <- pred_results %>% 
+    mutate(protein = rep(seq(0.2, protein_max, by = 0.01), length(id_d))) %>% 
+    select(id, protein, predict.id)
+  
+  # Predict all
+  ds_pred_all <- pred_results %>%
+    filter(id == id_d[1]) %>%
+    select(predict.fixed) %>% 
+    mutate(protein = seq(0.2, protein_max, by = 0.01))
+  
+  # Create plot
+  fig_all <- ggplot() +
+    geom_point(data, mapping = aes(x = protein, y = outcome), alpha = 0.6) +
+    geom_line(data, mapping = aes(x = protein, y = outcome, group = id), 
+              linetype = "dashed", alpha = 0.6) +
+    geom_line(ds_pred_all, mapping = aes(x = protein, y = predict.fixed), 
+              color = "#FF725C", linewidth = 1) +
+    geom_vline(xintercept = x_cp, color = "#4269D0") +
+    scale_y_continuous(limits = c(0, max(data$outcome) * 1.1)) +
+    labs(title = manuscript,
+         y = expression(" "^{"13"}~CO[2]),
+         x = "Protein intake per day [g/kg]") +
+    theme_bw() +
+    theme(panel.grid.minor = element_blank())
+  
+  fig_ind <- ggplot() +
+    geom_point(data, mapping = aes(x = protein, y = outcome), alpha = 0.8) +
+    geom_line(data, mapping = aes(x = protein, y = outcome), 
+              linetype = "dashed", alpha = 0.8) +
+    geom_line(ds_pred_ind, mapping = aes(x = protein, y = predict.id)) +
+    geom_vline(xintercept = x_cp, linetype = "dotted") +
+    scale_y_continuous(limits = c(0, max(data$outcome) * 1.1)) +
+    labs(title = manuscript,
+         y = expression(" "^{"13"}~CO[2]),
+         x = "Protein intake per day [g/kg]") +
+    theme_bw() +
+    theme(panel.grid.minor = element_blank()) +
+    facet_wrap(~id, ncol = 5)
+  
+  # Return results
+  list(
+    plots = list(fig_all, fig_ind),
+    model = model,
+    predictions = list(
+      individual = ds_pred_ind,
+      overall = ds_pred_all
+    ),
+    change_point = x_cp
+  )
+}
+```
+
+### Plot for mixed-effects Bayesian model
+```{r}
+
+# stan_results<- model4_stan_results
+plot_stan_results <- function(stan_results) {
+  stanfit <- stan_results$stanfit
+  data <- stan_results$data
+  ds_id <- stan_results$ds_id
+  manuscript <- stan_results$manuscript
+  
+  # パラメータ抽出
+  result_summary <- summary(stanfit)$summary[c("beta[1]", "beta[2]", "betakp"), ]
+  mcmc_samples <- rstan::extract(stanfit)
+  
+  
+  # 予測データ作成
+  pred_data <- data.frame(
+    id = stan_results$preddata$id_pred,
+    protein = stan_results$preddata$protein_pred
+  )
+  
+  
+  # pred_alphasの作成を修正
+  n_individuals <- n_distinct(pred_data$id)
+  
+  # median計算を安全に行う
+  alpha_medians <- apply(mcmc_samples$alpha_tosave, MARGIN = c(2,3), FUN = median)
+  
+  # データフレームの作成を修正
+  if (is.matrix(alpha_medians)) {
+    pred_alphas <- data.frame(
+      id = 1:nrow(alpha_medians),
+      V2 = alpha_medians[, 1],
+      V3 = alpha_medians[, 2],
+      V4 = alpha_medians[, 3]
+    )
+  } else {
+    stop("Unexpected structure of alpha_medians")
+  }
+  
+  
+  pred_data <- merge(pred_data, pred_alphas, by = "id", all.x = TRUE)
+  
+  
+  pred_data$y_predtraj <- pred_data$V2 + 
+    pred_data$V3 * pmin(pred_data$protein - pred_data$V4, 0)
+  
+  # 予測区間
+  y_pred_dim <- length(mcmc_samples$y_pred[1,])
+  expected_dim <- nrow(stan_results$preddata)
+  
+  
+  pred_lower <- data.frame(
+    id = stan_results$preddata$id_pred,
+    protein = stan_results$preddata$protein_pred,
+    y_pred_lower = apply(mcmc_samples$y_pred, 2, quantile, probs = 0.025)
+  )
+  
+  pred_upper <- data.frame(
+    id = stan_results$preddata$id_pred,
+    protein = stan_results$preddata$protein_pred,
+    y_pred_upper = apply(mcmc_samples$y_pred, 2, quantile, probs = 0.975)
+  )
+  
+  # ID変換テーブルの作成
+  ds_id_rename <- ds_id %>% rename(id3 = id, id = id2)
+  
+  # 予測データの結合
+  pred_data_final <- pred_data %>%
+    left_join(pred_lower, by = c("id", "protein")) %>%
+    left_join(pred_upper, by = c("id", "protein")) %>%
+    left_join(ds_id_rename, by = "id") %>%
+    filter(!is.na(id3)) %>%  # NAを除外
+    select(-id) %>%
+    rename(id = id3)
+  
+  pred_alphas_final <- pred_alphas %>%
+    left_join(ds_id_rename, by = "id") %>%
+    filter(!is.na(id3)) %>%  # NAを除外
+    select(-id) %>%
+    rename(id = id3)
+  
+  # 全体予測
+  df_marginal <- tibble(
+    protein = seq(min(data$protein), max(data$protein), by = 0.01)
+  ) %>% 
+    mutate(y = if_else(protein < result_summary[3,1], 
+                       result_summary[1,1] + result_summary[2,1] * (protein - result_summary[3,1]), 
+                       result_summary[1,1]))
+  
+  # プロット作成
+  fig_marginal <- ggplot() +
+    geom_point(data, mapping = aes(x = protein, y = outcome), alpha = 0.6) +
+    geom_line(data, mapping = aes(x = protein, y = outcome, group = id), 
+              linetype = "dashed", alpha = 0.6) +
+    geom_line(df_marginal, mapping = aes(x = protein, y = y), linewidth = 1, color = "#FF725C") +
+    geom_vline(xintercept = result_summary[3,1], color = "#4269D0") +
+    labs(title = manuscript,
+         y = expression(" "^{"13"}~CO[2]),
+         x = "Protein intake per day [g/kg]") +
+    theme_bw() +
+    theme(panel.grid.minor = element_blank())
+  
+  fig_individual <- ggplot() +
+    geom_ribbon(data = pred_data_final, 
+                aes(x = protein, ymin = y_pred_lower, ymax = y_pred_upper), 
+                fill = 'lightgray') +
+    geom_point(data = data, aes(x = protein, y = outcome), alpha = 0.8) +
+    geom_line(data = data, aes(x = protein, y = outcome), 
+              linetype = "dashed", alpha = 0.8) +
+    geom_line(data = pred_data_final, aes(x = protein, y = y_predtraj)) +
+    geom_vline(data = pred_alphas_final, aes(xintercept = V4), linetype = "dotted") +
+    labs(y = expression(" "^{"13"}~CO[2]),
+         x = "Protein intake per day [g/kg]") +
+    theme_bw() +
+    theme(panel.grid.minor = element_blank()) +
+    facet_wrap(~id, ncol = 5)
+  
+  list(
+    plots = list(marginal = fig_marginal, individual = fig_individual),
+    predictions = list(
+      marginal = df_marginal,
+      individual = pred_data_final,
+      change_points = pred_alphas_final
+    ),
+    parameters = result_summary
+  )
+}
+```
+
+
+
+
+## Estimation
+### Mixed-effects model
+```{r}
+estimate_mixed_segment <- function(data, random_slope = FALSE, plot_aic = FALSE) {
+  seq_x_cp <- seq(0.5, 2.5, by = 0.01)
+  n_x_cp <- length(seq_x_cp)
+  
+  results <- tibble(
+    x_cp = seq_x_cp,
+    AIC = NA_real_,
+    succeeded = 0
+  )
+  
+  for (i in 1:n_x_cp) {
+    temp_x_cp <- seq_x_cp[i]
+    
+    temp_data <- data %>%
+      mutate(X = I(protein < temp_x_cp) * (protein - temp_x_cp))
+    
+    if (random_slope) {
+      tryCatch({
+        model <- lme(outcome ~ X, data = temp_data, random = ~ X|id, 
+                     control = lmeControl(opt = 'optim'))
+        results$AIC[i] <- AIC(model)
+        results$succeeded[i] <- 1
+      }, error = function(e) {})
+    } else {
+      model <- lme(outcome ~ X, data = temp_data, random = ~ 1|id)
+      results$AIC[i] <- AIC(model)
+      results$succeeded[i] <- 1
+    }
+  }
+  
+  # Use only valid results
+  valid_results <- results %>% filter(succeeded == 1)
+  
+  if (nrow(valid_results) == 0) {
+    return(list(
+      estimates = tibble(cut_point = NA, cut_point_lower = NA, cut_point_upper = NA),
+      aic_plot = NULL,
+      aic_data = NULL
+    ))
+  }
+  
+  # Minimum AIC
+  x_cp_min <- valid_results$x_cp[which.min(valid_results$AIC)]
+  min_aic <- min(valid_results$AIC, na.rm = TRUE)
+  
+  # 95%CI
+  # The points closest to the minimum and maximum values, respectively, among those greater than the AIC minimum plus 4
+  
+  ci_lower <- valid_results %>%
+    filter(x_cp < x_cp_min, AIC >= min_aic + 4) %>%
+    arrange(desc(x_cp)) %>%
+    slice(1) %>%
+    pull(x_cp)
+  
+  ci_upper <- valid_results %>%
+    filter(x_cp > x_cp_min, AIC >= min_aic + 4) %>%
+    arrange(x_cp) %>%
+    slice(1) %>%
+    pull(x_cp)
+  
+  # Return NA if no CI boundary is found
+  if (length(ci_lower) == 0) ci_lower <- NA_real_
+  if (length(ci_upper) == 0) ci_upper <- NA_real_
+  
+  estimates <- tibble(
+    cut_point = x_cp_min,
+    cut_point_lower = ci_lower,
+    cut_point_upper = ci_upper
+  )
+  
+  # AIC Trend Chart
+  aic_plot <- NULL
+  if (plot_aic) {
+    ci_lines <- tibble(
+      xintercept = c(ci_lower, ci_upper)
+    ) %>%
+      filter(!is.na(xintercept))
+    
+    aic_plot <- ggplot(valid_results, aes(x = x_cp, y = AIC)) +
+      geom_line(color = "gray50") +
+      geom_point(size = 1, color = "gray50") +
+      geom_vline(xintercept = x_cp_min, color = "red", linetype = "solid") +
+      geom_hline(yintercept = min_aic + 4, 
+                 color = "blue", linetype = "dotted", alpha = 0.7) +
+      geom_point(data = filter(valid_results, x_cp == x_cp_min),
+                 color = "red", size = 3) +
+      annotate("text", x = x_cp_min, y = min(valid_results$AIC) - 1,
+               label = paste0("CP = ", round(x_cp_min, 3)),
+               hjust = 0.5, size = 3) +
+      labs(x = "Change point (g/kg/day)", 
+           y = "AIC",
+           title = "AIC profile") +
+      theme_bw() +
+      theme(panel.grid.minor = element_blank())
+    
+    # Only add confidence intervals if they exist
+    
+    if (nrow(ci_lines) > 0) {
+      aic_plot <- aic_plot +
+        geom_vline(data = ci_lines, aes(xintercept = xintercept),
+                   color = "red", linetype = "dashed", alpha = 0.7)
+    }
+    
+    if (is.na(ci_lower) || is.na(ci_upper)) {
+      aic_plot <- aic_plot +
+        labs(caption = "Note: 95% CI could not be estimated (shown as NA)")
+    }
+  }
+  
+  list(
+    estimates = estimates,
+    aic_plot = aic_plot,
+    aic_data = valid_results
+  )
+}
+
+```
+
+### Mixed-effects Bayesian model
+```{r}
+
+# data <- data_by_manuscript$data[[1]]
+# stan_file = "04_Script/estimate_bayes_stan.stan"
+# manuscript = "1: Rafii, 2015"
+# betakp_lower = 0.5
+# betakp_upper = 2
+# chains = 4
+# iter = 4000
+# warmup = 1000
+# adapt_delta = 0.95
+# max_treedepth = 20
+# seed = 1
+# pars = NULL
+
+run_stan_model <- function(data, manuscript, 
+                           stan_file = "04_Script/estimate_bayes_stan.stan",
+                           betakp_lower = 0.5,
+                           betakp_upper = 2,
+                           chains = 4,
+                           iter = 4000,
+                           warmup = 1000,
+                           adapt_delta = 0.99,
+                           max_treedepth = 20,
+                           seed = 1,
+                           pars = NULL) {
+  # Data preparation
+  ds_id <- data %>% 
+    distinct(id) %>% 
+    mutate(id2 = row_number())
+  
+  ds_stan_input <- data %>%
+    left_join(ds_id, by = "id") %>% 
+    select(-id) %>% 
+    rename(id = id2)
+  
+  # Data for prediction
+  preddata <- expand_grid(
+    id_pred = unique(ds_stan_input$id),
+    protein_pred = seq(min(ds_stan_input$protein), 
+                       max(ds_stan_input$protein), by = 0.01)
+  )
+  
+  # Stan setting
+  stan_data <- list(
+    N = nrow(ds_stan_input),
+    Npat = n_distinct(ds_stan_input$id),
+    id = ds_stan_input$id,
+    protein = ds_stan_input$protein,
+    y = ds_stan_input$outcome,
+    Npred = nrow(preddata),
+    Npat_pred = n_distinct(preddata$id_pred),
+    id_pred = preddata$id_pred,
+    protein_pred = preddata$protein_pred,
+    protein_min = min(ds_stan_input$protein),
+    protein_max = max(ds_stan_input$protein),
+    zeros3 = rep(0, 3),
+    betakp_lower = betakp_lower,
+    betakp_upper = betakp_upper
+  )
+  
+  
+  # Stan parameter
+  if (is.null(pars)) {
+    pars <- c("beta", "betakp", "y_sd", "u_sd", "u_Sigma",
+              "y_mu_pred", "y_pred", "alpha_tosave", "lp__")
+  }
+  
+  # Run stan
+  stanfit <- stan(
+    file = here(stan_file),
+    data = stan_data,
+    pars = pars,
+    seed = seed,
+    chains = chains,
+    iter = iter,
+    warmup = warmup,
+    control = list(adapt_delta = adapt_delta, max_treedepth = max_treedepth)
+  )
+  
+  
+  
+  list(
+    stanfit = stanfit,
+    data = data,
+    ds_id = ds_id,
+    preddata = preddata,
+    manuscript = manuscript,
+    stan_file = stan_file,
+    stan_data = stan_data,
+    stan_params = list(
+      betakp_lower = betakp_lower,
+      betakp_upper = betakp_upper,
+      chains = chains,
+      iter = iter,
+      warmup = warmup,
+      adapt_delta = adapt_delta,
+      max_treedepth = max_treedepth,
+      seed = seed,
+      pars = pars
+    )
+  )
+}
+
+
+```
+
+# Analyses
+## Data Preparation and Individual Plots
+```{r}
+# Split data by manuscript
+data_by_manuscript <- ds00 %>% 
+  group_nest(manuscript)
+
+# Individual Plot Creation
+individual_plots <- data_by_manuscript %>%
+  mutate(plot = map2(data, manuscript, plot_individual))
+
+# Plot Display
+walk2(individual_plots$plot, individual_plots$manuscript, 
+      ~{print(.x); cat("\n")})
+```
+
+
+
+## Model 2: Mixed-effects model with intercept as a random effect approach
+
+```{r}
+#| message: false
+
+# Run Estimation
+model2_results <- data_by_manuscript %>%
+  mutate(
+    estimation_results = map(data, ~estimate_mixed_segment(.x, random_slope = FALSE, plot_aic = TRUE)),
+    estimates = map(estimation_results, "estimates"),
+    aic_plots = map(estimation_results, "aic_plot"),
+    aic_data = map(estimation_results, "aic_data"),
+    model_output = pmap(list(data, estimates, manuscript), 
+                        ~plot_mixed_model(..1, ..2, ..3, random_slope = FALSE))
+  )
+
+# Show results
+model2_results %>%
+  select(manuscript, estimates) %>%
+  unnest(estimates) %>%
+  gt()
+
+# AIC
+walk2(model2_results$aic_plots, model2_results$manuscript,
+      ~{
+        if (!is.null(.x)) {
+          print(.x + labs(subtitle = .y))
+          cat("\n")
+        }
+      })
+
+# Save results
+model2_saved <- model2_results %>%
+  mutate(
+    plots = map(model_output, "plots"),
+    models = map(model_output, "model"),
+    predictions = map(model_output, "predictions"),
+    change_points = map(model_output, "change_point")
+  ) %>%
+  select(-model_output, -estimation_results)
+
+# Show Full Plot
+model2_saved$plots[[1]][[1]] + model2_saved$plots[[2]][[1]] + 
+  model2_saved$plots[[3]][[1]] + model2_saved$plots[[4]][[1]]
+
+# Show individual plot
+# walk2(map(model2_saved$plots, 2), model2_saved$manuscript,
+#       ~{print(.x); cat("\n")})
+
+```
+
+
+
+## Model 3: Mixed-effects model with intercept and slope as a random effect approach
+
+```{r}
+#| message: false
+
+# Run Estimation
+model3_results <- data_by_manuscript %>%
+  mutate(
+    estimation_results = map(data, ~estimate_mixed_segment(.x, random_slope = TRUE, plot_aic = TRUE)),
+    estimates = map(estimation_results, "estimates"),
+    aic_plots = map(estimation_results, "aic_plot"),
+    aic_data = map(estimation_results, "aic_data"),
+    model_output = pmap(list(data, estimates, manuscript), 
+                        ~plot_mixed_model(..1, ..2, ..3, random_slope = TRUE))
+  )
+
+# Show results
+model3_results %>%
+  select(manuscript, estimates) %>%
+  unnest(estimates) %>%
+  gt()
+
+# AIC
+walk2(model3_results$aic_plots, model3_results$manuscript,
+      ~{
+        if (!is.null(.x)) {
+          print(.x + labs(subtitle = .y))
+          cat("\n")
+        }
+      })
+
+# Save results
+model3_saved <- model3_results %>%
+  mutate(
+    plots = map(model_output, "plots"),
+    models = map(model_output, "model"),
+    predictions = map(model_output, "predictions"),
+    change_points = map(model_output, "change_point")
+  ) %>%
+  select(-model_output)
+
+# Show Full Plot
+model3_saved$plots[[1]][[1]] + model3_saved$plots[[2]][[1]] + 
+  model3_saved$plots[[3]][[1]] + model3_saved$plots[[4]][[1]]
+
+# Show individual plot
+# walk2(map(model3_saved$plots, 2), model3_saved$manuscript,
+#       ~{print(.x); cat("\n")})
+```
+
+
+
+## Model 4: Mixed-effects Bayesian model with intercept, slope and change point as a random effect approach
+
+
+```{r}
+#| message: false
+
+# Perform sensitivity analysis simultaneously
+
+model4_stan_results <- data_by_manuscript %>%
+  mutate(stan_results = map2(data, manuscript, 
+                             betakp_lower = 0,
+                             betakp_upper = 2.5,
+                             ~run_stan_model(.x, .y)))
+
+model4_results <- model4_stan_results %>%
+  mutate(
+    processed = map(stan_results, plot_stan_results),
+    plots = map(processed, "plots"),
+    predictions = map(processed, "predictions"),
+    parameters = map(processed, "parameters")
+  )
+
+model4_results %>%
+  mutate(
+    betakp = map_dbl(parameters, ~.[3, 1]),
+    betakp_lower = map_dbl(parameters, ~.[3, 4]),
+    betakp_upper = map_dbl(parameters, ~.[3, 8])
+  ) %>%
+  select(manuscript, betakp, betakp_lower, betakp_upper) %>%
+  gt() %>%
+  fmt_number(columns = 2:4, decimals = 3)
+
+
+model4_results$plots[[1]]$marginal + model4_results$plots[[2]]$marginal + 
+  model4_results$plots[[3]]$marginal + model4_results$plots[[4]]$marginal
+```
+
+### Trase plot
+```{r}
+walk2(model4_stan_results$stan_results, model4_stan_results$manuscript,
+      ~{
+        cat("\n", .y, "\n")
+        print(traceplot(.x$stanfit, pars = c(
+          "beta", "betakp",
+          "u_sd"
+        ), 
+        inc_warmup = TRUE))
+      })
+```
+
+
+### Sensitivity analysis
+```{r}
+#| message: false
+
+# Perform sensitivity analysis simultaneously
+
+model4_stan_results <- data_by_manuscript %>%
+  mutate(stan_results = map2(data, manuscript, 
+                             betakp_lower = 0.5,
+                             betakp_upper = 2.5,
+                             ~run_stan_model(.x, .y,
+                                             stan_file = "04_Script/estimate_bayes_stan.stan")))
+
+model4_results <- model4_stan_results %>%
+  mutate(
+    processed = map(stan_results, plot_stan_results),
+    plots = map(processed, "plots"),
+    predictions = map(processed, "predictions"),
+    parameters = map(processed, "parameters")
+  )
+
+model4_results %>%
+  mutate(
+    betakp = map_dbl(parameters, ~.[3, 1]),
+    betakp_lower = map_dbl(parameters, ~.[3, 4]),
+    betakp_upper = map_dbl(parameters, ~.[3, 8])
+  ) %>%
+  select(manuscript, betakp, betakp_lower, betakp_upper) %>%
+  gt() %>%
+  fmt_number(columns = 2:4, decimals = 3)
+
+
+model4_results$plots[[1]]$marginal + model4_results$plots[[2]]$marginal + 
+  model4_results$plots[[3]]$marginal + model4_results$plots[[4]]$marginal
+```
+
+
+# Figure for manuscript
+## Combine
+
+```{r}
+# Data preparation function for model comparison
+prepare_model_comparison_data <- function(model2, model3, model4) {
+  # Extract prediction data for each model
+  comparison_data <- tibble(manuscript = model2$manuscript) %>%
+    mutate(
+      model2_pred = map(model2$predictions, "overall"),
+      model2_cp = model2$change_points,
+      
+      model3_pred = map(model3$predictions, "overall"),
+      model3_cp = model3$change_points,
+      
+      model4_pred = map(model4$predictions, "marginal"),
+      model4_cp = map_dbl(model4$parameters, ~.[3, 1]),
+      
+      original_data = model2$data
+    )
+  
+  comparison_data
+}
+
+# Individual comparison plotting function
+create_comparison_plot <- function(data, manuscript_name) {
+  
+  original <- data$original_data[[1]]
+  
+  model2_pred <- data$model2_pred[[1]]
+  model3_pred <- data$model3_pred[[1]]
+  model4_pred <- data$model4_pred[[1]]
+  
+  cp2 <- data$model2_cp[[1]]
+  cp3 <- data$model3_cp[[1]]
+  cp4 <- data$model4_cp[[1]]
+  
+  # Plot
+  p <- ggplot() +
+    
+    # geom_line(data = original, 
+    #           aes(x = protein, y = outcome, group = id), 
+    #           alpha = 0.5, linetype = "solid", color = "#9498a0") +
+    
+    geom_point(data = original, 
+               aes(x = protein, y = outcome, group = id, shape = id), 
+               size = 1.2, alpha = 0.5, show.legend = FALSE) +
+    
+    # Model 2
+    geom_line(data = model2_pred, 
+              aes(x = protein, y = predict.fixed, color = "Model 2"), alpha = 0.8) +
+    geom_vline(aes(xintercept = cp2, color = "Model 2"), 
+               linetype = "dashed", alpha = 0.8, show.legend = FALSE) +
+    
+    # Model 3
+    geom_line(data = model3_pred, 
+              aes(x = protein, y = predict.fixed, color = "Model 3"), alpha = 0.8) +
+    geom_vline(aes(xintercept = cp3, color = "Model 3"), 
+               linetype = "dashed", alpha = 0.8, show.legend = FALSE) +
+    
+    # Model 4
+    geom_line(data = model4_pred, 
+              aes(x = protein, y = y, color = "Model 4"), alpha = 0.8) +
+    geom_vline(aes(xintercept = cp4, color = "Model 4"), 
+               linetype = "dashed", alpha = 0.8, show.legend = FALSE) +
+    scale_y_continuous(limits = c(0, max(original$outcome) * 1.1)) +
+    scale_x_continuous(limits = c(0,2.6), breaks = seq(0,2.5,0.5)) +
+    
+    scale_color_manual(
+      name = NULL,
+      values = c(
+        "Model 2" = "#4269d0",
+        "Model 3" = "#6cc5b0",
+        "Model 4" = "#ff725c"
+      ),
+      labels = c(
+        "Model 2" = "Model 2",
+        "Model 3" = "Model 3",
+        "Model 4" = "Model 4"
+      )
+    ) +
+    
+    labs(title = manuscript_name,
+         x = "Protein intake per day [g/kg]",
+         y = expression(""^{13}~CO[2])) +
+    
+    theme_bw() +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(size = 12, face = "bold")
+    )
+  
+  p
+}
+
+
+# Create Model Comparison Plot
+comparison_data <- prepare_model_comparison_data(model2_saved, model3_saved, model4_results)
+
+# Plotting Each Study
+comparison_plots <- comparison_data %>%
+  mutate(
+    plot = map2(
+      seq_len(n()),
+      manuscript,
+      ~create_comparison_plot(comparison_data[.x, ], .y)
+    )
+  )
+
+
+# combine plots
+combined_plot <- (comparison_plots$plot[[1]] + comparison_plots$plot[[2]]) / 
+  (comparison_plots$plot[[3]] + comparison_plots$plot[[4]]) +
+  plot_layout(guides = 'collect') &
+  theme(legend.position='bottom')
+print(combined_plot)
+ggsave(here("03_Output/fig1.png"), dpi = 400, width = 7, height = 5)
+
+```
+
+
+## Individuals
+```{r}
+
+
+prepare_individual_comparison_data <- function(model2, model3, model4) {
+  
+  comparison_data <- tibble(
+    manuscript = model2$manuscript,
+    original_data = model2$data,
+    model2_pred_ind = map(model2$predictions, "individual"),
+    model3_pred_ind = map(model3$predictions, "individual"),
+    model4_pred_ind = map(model4$predictions, "individual"),
+    model2_change_points = model2$change_points,
+    model3_change_points = model3$change_points,
+    model4_change_points = map(model4$predictions, "change_points")
+  )
+  
+  comparison_data
+}
+
+
+# Individual Model Comparison Plotting Function
+create_individual_comparison_plot <- function(data_row, manuscript_name) {
+  
+  original <- data_row$original_data
+  model2_pred_ind <- data_row$model2_pred_ind
+  model3_pred_ind <- data_row$model3_pred_ind
+  model4_pred_ind <- data_row$model4_pred_ind
+  model2_change_points <- data_row$model2_change_points
+  model3_change_points <- data_row$model3_change_points
+  model4_change_points <- data_row$model4_change_points
+  
+  if (is.list(original) && !is.data.frame(original)) {
+    original <- original[[1]]
+  }
+  if (is.list(model2_pred_ind) && !is.data.frame(model2_pred_ind)) {
+    model2_pred_ind <- model2_pred_ind[[1]]
+  }
+  if (is.list(model3_pred_ind) && !is.data.frame(model3_pred_ind)) {
+    model3_pred_ind <- model3_pred_ind[[1]]
+  }
+  if (is.list(model4_pred_ind) && !is.data.frame(model4_pred_ind)) {
+    model4_pred_ind <- model4_pred_ind[[1]]
+  }
+  if (is.list(model2_change_points) && !is.data.frame(model2_change_points)) {
+    model2_change_points <- model2_change_points[[1]]
+  }
+  if (is.list(model3_change_points) && !is.data.frame(model3_change_points)) {
+    model3_change_points <- model3_change_points[[1]]
+  }
+  if (is.list(model4_change_points) && !is.data.frame(model4_change_points)) {
+    model4_change_points <- model4_change_points[[1]]
+  }
+  
+  original <- original %>% mutate(id = as.character(id))
+  model2_pred_ind <- model2_pred_ind %>% mutate(id = as.character(id))
+  model3_pred_ind <- model3_pred_ind %>% mutate(id = as.character(id))
+  model4_pred_ind <- model4_pred_ind %>% mutate(id = as.character(id))
+  model4_change_points <- model4_change_points %>% mutate(id = as.character(id))
+  
+  # Create individual plots
+  individual_plots <- original %>%
+    distinct(id) %>%
+    pull(id) %>%
+    map(function(individual_id) {
+      ind_data <- original %>% filter(id == individual_id)
+      ind_pred2 <- model2_pred_ind %>% filter(id == individual_id)
+      ind_pred3 <- model3_pred_ind %>% filter(id == individual_id)
+      ind_pred4 <- model4_pred_ind %>% filter(id == individual_id)
+      ind_cp4 <- model4_change_points %>% filter(id == individual_id)
+      
+      p <- ggplot() +
+        
+        geom_line(data = ind_data, 
+                  aes(x = protein, y = outcome), 
+                  linetype = "solid", alpha = 0.8, color = "#9498a0") +
+        geom_point(data = ind_data, 
+                   aes(x = protein, y = outcome), 
+                   size = 1.2, alpha = 0.8) +
+        
+        # Model 2
+        geom_line(data = ind_pred2, 
+                  aes(x = protein, y = predict.id, color = "Model 2"), alpha = 0.8) +
+        geom_vline(aes(xintercept = model2_change_points, color = "Model 2"), 
+                   linetype = "dashed", alpha = 0.8, show.legend = FALSE) +
+        
+        
+        # Model 3
+        geom_line(data = ind_pred3, 
+                  aes(x = protein, y = predict.id, color = "Model 3"), alpha = 0.8) +
+        geom_vline(aes(xintercept = model3_change_points, color = "Model 3"), 
+                   linetype = "dashed", alpha = 0.8, show.legend = FALSE) +
+        
+        # Model 4
+        geom_line(data = ind_pred4, 
+                  aes(x = protein, y = y_predtraj, color = "Model 4"), alpha = 0.8) +
+        geom_vline(data = ind_cp4,
+                   aes(xintercept = V4, color = "Model 4"), 
+                   linetype = "dashed", alpha = 0.6, show.legend = FALSE) +
+        
+        scale_color_manual(
+          name = NULL,
+          values = c(
+            "Model 2" = "#4269d0",
+            "Model 3" = "#6cc5b0",
+            "Model 4" = "#ff725c"
+          ),
+          labels = c(
+            "Model 2" = "Model 2",
+            "Model 3" = "Model 3",
+            "Model 4" = "Model 4"
+          )
+        ) +
+        scale_y_continuous(limits = c(0, max(original$outcome) * 1.1)) +
+        scale_x_continuous(limits = c(0,2.6), breaks = seq(0,2.5,0.5)) +
+        
+        labs(title = paste0("ID: ",as.character(individual_id)),
+             x = "Protein [g/kg/day]",
+             y = expression(""^{13}~CO[2])) +
+        theme_bw() +
+        theme(
+          panel.grid.minor = element_blank(),
+          plot.title = element_text(size = 10),
+          axis.title = element_text(size = 8),
+          axis.text = element_text(size = 7)
+        )
+      
+      p
+    })
+  
+  final_plot <- wrap_plots(individual_plots, ncol = 4) +
+    plot_annotation(
+      title = manuscript_name
+    ) +
+    plot_layout(guides = 'collect') &
+    theme(legend.position='bottom')
+  
+  
+  
+  final_plot
+}
+
+comparison_data_individual <- prepare_individual_comparison_data(model2_saved, model3_saved, model4_results)
+
+
+individual_comparison_plots <- comparison_data_individual %>%
+  mutate(
+    individual_plot = map2(
+      seq_len(n()),
+      manuscript,
+      ~create_individual_comparison_plot(comparison_data_individual[.x, ], .y)
+    )
+  )
+
+walk2(individual_comparison_plots$individual_plot, 
+      individual_comparison_plots$manuscript,
+      ~{
+        print(.x)
+        cat("\n\n")
+      })
+
+individual_counts <- comparison_data_individual %>%
+  mutate(n_individuals = map_int(original_data, ~n_distinct(.x$id))) %>%
+  select(manuscript, n_individuals)
+individual_counts
+
+
+# Save pdf
+walk2(individual_comparison_plots$individual_plot, 
+      individual_comparison_plots$manuscript,
+      ~{
+        n_ind <- individual_counts %>%
+          filter(manuscript == .y) %>%
+          pull(n_individuals)
+        
+        n_cols <- 4
+        n_rows <- ceiling(n_ind / n_cols)
+        
+        # size
+        ind_width <- 1.5
+        ind_height <- 1.4
+        margin_width <- 1
+        margin_height <- 1.5
+        
+        total_width <- (ind_width * n_cols) + margin_width
+        total_height <- (ind_height * n_rows) + margin_height
+        
+        filename_pdf <- paste0("individual_comparison_", 
+                               gsub(" ", "_", gsub(":", "", .y)), 
+                               ".pdf")
+        
+        ggsave(
+          filename = here("03_Output", filename_pdf),
+          plot = .x,
+          width = total_width,
+          height = total_height,
+          units = "in",
+          device = "pdf"
+        )
+      })
+```
+
+
+# Save
+```{r}
+#| eval: false
+#| include: false
+
+all_results <- list(
+  data = ds00,
+  model2 = model2_saved,
+  model3 = model3_saved,
+  model4 = model4_results,
+  comparison_data = comparison_data,
+  comparison_data_individual = comparison_data_individual,
+  comparison_plots = comparison_plots,
+  individual_comparison_plots = individual_comparison_plots
+)
+
+saveRDS(all_results, here("01_Data/all_model_results.rds"))
+```
+
+# R session information
+```{r}
+sessioninfo::session_info()
+```
+
