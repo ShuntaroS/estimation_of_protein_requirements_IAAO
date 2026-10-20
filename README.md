@@ -1,5 +1,7 @@
 # Change-point estimation of protein requirements with the IAAO method: code and data
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23492338.svg)](https://doi.org/10.5281/zenodo.23492338)
+
 This repository contains the data and R code for the following article:
 
 > Sato S, Hatamoto Y, Matsumoto M. Change-Point Estimation of Protein Requirements Allowing for Inter-Individual Variation Using the Indicator Amino Acid Oxidation Method: A Bayesian Random Change-Point Model. *PLOS ONE* (under review).
@@ -97,6 +99,13 @@ The version of this repository at submission (release v1.0) contains `analyses_4
 2. **Models 2 and 3**: the candidate change-points now range from 0 to 2.5 g/kg/day, the same range as in Model 4 (submitted: 0.5 to 2.5). The estimates and intervals for the four datasets are unchanged.
 3. **Tang model and simulation study**: added.
 4. **Figures**: in the figure of the fitted lines, the submitted code drew only the first six participants of each study because of the default palette of point shapes; all participants are now shown.
+
+## Citation
+
+If you use this code or data, please cite the article and this archive:
+
+- Sato S, Hatamoto Y, Matsumoto M. Change-Point Estimation of Protein Requirements Allowing for Inter-Individual Variation Using the Indicator Amino Acid Oxidation Method: A Bayesian Random Change-Point Model. PLOS ONE (under review).
+- Sato S. Code and data for: Change-point estimation of protein requirements allowing for inter-individual variation using the indicator amino acid oxidation method (version 2.0). Zenodo; 2026. https://doi.org/10.5281/zenodo.23492338
 
 ## License
 
