@@ -8,6 +8,10 @@ data {
   real<lower=0> betakp_lower;       // lower bound for mean change point
   real<lower=0> betakp_upper;       // upper bound for mean change point
 
+  // R1 revision: scale of the half-normal prior for the SD of the random change-point,
+  // passed as data so that the primary (0.3) and sensitivity (1) analyses use the same model
+  real<lower=0> prior_sd_cp;
+
   int<lower=0> Npred;               // number of predicted observations
   int<lower=0> Npat_pred;           // number of individuals to predict
   real<lower=0> protein_pred[Npred];// protein for prediction
@@ -76,9 +80,9 @@ model {
   // priors: SDs
   u_sd[1] ~ normal(0, 5);
   u_sd[2] ~ normal(0, 5);
-  
-  // knot の個体差は特に不安定になりやすいので，やや強めに正則化
-  u_sd[3] ~ normal(0, 0.3);
+
+  // SD of the random change-point (half-normal; scale given as data)
+  u_sd[3] ~ normal(0, prior_sd_cp);
 
   // residual sd
   y_sd ~ normal(0, 5);

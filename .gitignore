@@ -1,0 +1,27 @@
+# Local files for preparing the manuscript (not part of the public repository)
+README_ja.docx
+assemble_submission.py
+make_table_sensitivity.py
+simulation/make_table_simulation.py
+figures/make_fig1_schematic.R
+tables/
+
+# Outputs written when the reports are rendered
+output/
+figures/*.csv
+figures/*.tiff
+figures/*.pdf
+
+# Compiled Stan model and logs
+model4_random_cp.rds
+*.log
+*_log.txt
+
+# R, RStudio, Quarto, and macOS
+*.Rproj
+.Rproj.user/
+.Rhistory
+.RData
+.quarto/
+*_files/
+.DS_Store

@@ -1,0 +1,387 @@
+---
+title: "Change-point estimation of protein requirements from IAAO data: analyses for the R1 revision"
+author:
+  - Shuntaro Sato
+date: now
+date-format: "YYYY/MM/DD, HH:mm"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-line-numbers: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  warning: true
+---
+
+# Setup
+
+This document reproduces the analyses of the four published datasets for the revised manuscript
+(PONE-D-26-20307, R1). Changes from the submitted code (`analyses_4studies_2506.qmd` in the version of this repository at submission)
+are listed at the top of `functions.R`; in short, the bounds of the population change-point of
+Model 4 are now passed to Stan, and the scale of the prior for the SD of the random
+change-point is an argument. The simulation study is in `simulation_report.qmd`.
+
+```{r}
+#| output: false
+source("functions.R")
+library(patchwork)
+library(gt)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = 4)
+
+dir.create("output", showWarnings = FALSE)
+
+ds <- load_ds("data/ds_4studies.rds")
+data_by_study <- ds |>
+  group_nest(manuscript) |>
+  mutate(data = map(data, ~ mutate(.x, id = fct_drop(id))))
+
+study_labels <- c(
+  "a: Rafii, 2015"  = "(A) Rafii et al. (2015)",
+  "b: Packer, 2017" = "(B) Packer et al. (2017)",
+  "c: Mao, 2020"    = "(C) Mao et al. (2020)",
+  "d: Wu, 2024"     = "(D) Wu et al. (2024)"
+)
+
+# Published EAR and upper value (upper limit of the 95% CI; recommended nutrient intake for Mao)
+published <- tribble(
+  ~manuscript,       ~pub_ear, ~pub_upper,
+  "a: Rafii, 2015",  0.96,     1.29,
+  "b: Packer, 2017", 1.20,     1.40,
+  "c: Mao, 2020",    0.91,     1.17,
+  "d: Wu, 2024",     0.94,     1.13
+)
+
+model_colors <- c("Model 2" = "#4269d0", "Model 3" = "#6cc5b0", "Model 4" = "#ff725c")
+y_lab <- expression({}^{13} * CO[2])
+x_lab <- "Protein intake (g/kg/day)"
+x_scale <- scale_x_continuous(breaks = seq(0, 2.5, by = 0.5))
+```
+
+# Data
+
+```{r}
+data_summary <- data_by_study |>
+  mutate(summ = map(data, function(d) {
+    per_id <- d |> group_by(id) |> summarise(k = n(), .groups = "drop")
+    tibble(
+      n_participants = n_distinct(d$id),
+      n_obs = nrow(d),
+      obs_per_participant = sprintf("%g (%d-%d)", median(per_id$k), min(per_id$k), max(per_id$k)),
+      intake_range = sprintf("%.2f-%.2f", min(d$protein), max(d$protein)),
+      n_intake_levels = n_distinct(d$protein)
+    )
+  })) |>
+  select(manuscript, summ) |>
+  unnest(summ)
+
+write_csv(data_summary, "output/table_data_summary.csv")
+gt(data_summary)
+```
+
+# Models 2 and 3
+
+As in the submitted analysis: `lme()` with REML, and the 95% CI defined by the candidate
+change-points closest to the estimate at which the AIC exceeds its minimum by 4. The candidate
+change-points span 0 to 2.5 g/kg/day by 0.01 (submitted: 0.5 to 2.5), the same range as the
+bounds of the population change-point in Model 4; the results are identical with both ranges.
+
+```{r}
+#| message: false
+mixed <- expand_grid(study = seq_len(nrow(data_by_study)), model = c("Model 2", "Model 3")) |>
+  mutate(res = map2(study, model, function(s, m) {
+    profile_mixed_cp(data_by_study$data[[s]], random_slope = (m == "Model 3"))
+  })) |>
+  mutate(manuscript = data_by_study$manuscript[study]) |>
+  unnest(res)
+
+mixed |>
+  select(manuscript, model, cp, lower, upper) |>
+  write_csv("output/table_models23.csv")
+
+mixed |>
+  select(manuscript, model, cp, lower, upper) |>
+  gt(groupname_col = "manuscript") |>
+  fmt_number(columns = c(cp, lower, upper), decimals = 2)
+```
+
+# Model 4
+
+Settings:
+
+* **primary**: population change-point bounded to (0, 2.5) g/kg/day with a Normal(0, 1) prior on the logit scale; half-normal(0, 0.3) prior for the SD of the random change-point.
+* **sd10**: as primary, with a half-normal(0, 1) prior for the SD of the random change-point (sensitivity analysis).
+* **as_submitted**: as primary, but with bounds (0.5, 2.0); this reproduces the submitted HTML report (the bounds were not passed to Stan).
+
+```{r}
+#| message: false
+sm <- stan_model("model4_random_cp.stan")
+
+m4_settings <- tribble(
+  ~setting,        ~prior_sd_cp, ~lower, ~upper,
+  "primary",       0.3,          0,      2.5,
+  "sd10",          1.0,          0,      2.5,
+  "as_submitted",  0.3,          0.5,    2.0
+)
+
+m4 <- expand_grid(study = seq_len(nrow(data_by_study)), s = seq_len(nrow(m4_settings))) |>
+  mutate(out = map2(study, s, function(study, s) {
+    st <- m4_settings[s, ]
+    d <- data_by_study$data[[study]]
+    res <- run_model4(sm, d, prior_sd_cp = st$prior_sd_cp, lower = st$lower, upper = st$upper,
+                      save_pred = (st$setting == "primary"))
+    out <- list(
+      pop = summarise_model4(res),
+      ind = individual_model4(res),
+      sd_cp_draws = rstan::extract(res$fit, pars = "u_sd")$u_sd[, 3],
+      curves = if (st$setting == "primary") curves_model4(res) else NULL
+    )
+    rm(res); gc()
+    out
+  })) |>
+  mutate(manuscript = data_by_study$manuscript[study], setting = m4_settings$setting[s])
+
+m4_pop <- m4 |> mutate(pop = map(out, "pop")) |> select(manuscript, setting, pop) |> unnest(pop)
+m4_ind <- m4 |> mutate(ind = map(out, "ind")) |> select(manuscript, setting, ind) |> unnest(ind)
+
+write_csv(m4_pop, "output/table_model4_settings.csv")
+write_csv(m4_ind, "output/table_model4_individual.csv")
+
+m4_pop |>
+  select(manuscript, setting, cp_median, cp_lower, cp_upper, sd_cp_median, sd_cp_lower, sd_cp_upper,
+         max_rhat, min_ess_bulk, n_divergent, secs) |>
+  gt(groupname_col = "manuscript") |>
+  fmt_number(columns = c(cp_median, cp_lower, cp_upper, sd_cp_median, sd_cp_lower, sd_cp_upper), decimals = 3) |>
+  fmt_number(columns = c(max_rhat), decimals = 3) |>
+  fmt_number(columns = c(min_ess_bulk, secs), decimals = 0)
+```
+
+# Random change-point model of Tang et al. (2014)
+
+Only the change-point varies among participants; maximum likelihood with the exact likelihood (ML) and
+with the first-order approximation (FO) used by Mao et al. (2020). RDA = mean + 1.96 SD of the
+change-points. Published values: Mao et al. (2020) EAR 0.91 (95% CI 0.76-1.06), RNI 1.17;
+Wu et al. (2024) EAR 0.94 (95% CI 0.75-1.13), RNI (EAR + 1.96 SD) 1.36.
+
+```{r}
+tang <- expand_grid(study = seq_len(nrow(data_by_study)), approx = c("ML", "FO")) |>
+  mutate(res = map2(study, approx, function(s, a) fit_tang(data_by_study$data[[s]], a, individual = FALSE)$pop),
+         manuscript = data_by_study$manuscript[study]) |>
+  select(manuscript, approx, res) |>
+  unnest(res)
+write_csv(tang, "output/table_tang_published_data.csv")
+tang |>
+  select(manuscript, approx, est, lower, upper, tau, rda, rda_lower, rda_upper) |>
+  gt(groupname_col = "manuscript") |>
+  fmt_number(columns = -c(manuscript, approx), decimals = 2)
+```
+
+# Table 2 (revised)
+
+Point estimates with the upper limits of the 95% intervals (Models 2 and 3: AIC-based CI;
+Model 4: posterior median and 95% credible interval, primary setting). The full intervals are
+written to `output/table2_full.csv`.
+
+```{r}
+fmt_upper <- function(est, upper) sprintf("%.2f (%.2f)", est, upper)
+table2 <- published |>
+  transmute(manuscript, Published = fmt_upper(pub_ear, pub_upper)) |>
+  left_join(
+    mixed |> transmute(manuscript, model, value = fmt_upper(cp, upper)) |>
+      pivot_wider(names_from = model, values_from = value),
+    by = "manuscript"
+  ) |>
+  left_join(
+    m4_pop |> filter(setting == "primary") |>
+      transmute(manuscript, `Model 4` = fmt_upper(cp_median, cp_upper)),
+    by = "manuscript"
+  )
+write_csv(table2, "output/table2_revised.csv")
+gt(table2)
+
+table2_full <- bind_rows(
+  mixed |> transmute(manuscript, model, est = cp, lower, upper),
+  m4_pop |> filter(setting == "primary") |>
+    transmute(manuscript, model = "Model 4", est = cp_median, lower = cp_lower, upper = cp_upper)
+)
+write_csv(table2_full, "output/table2_full.csv")
+
+# Model 4: submitted Table 2, submitted HTML report (as_submitted), and revised analysis (primary);
+# posterior means, as in the submitted report
+m4_pop |>
+  filter(setting %in% c("as_submitted", "primary")) |>
+  transmute(manuscript, setting, value = fmt_upper(cp_mean, cp_upper)) |>
+  pivot_wider(names_from = setting, values_from = value) |>
+  left_join(tibble(manuscript = published$manuscript,
+                   submitted_table2 = c("1.31 (1.58)", "1.59 (1.96)", "0.90 (1.05)", "0.86 (1.05)")),
+            by = "manuscript") |>
+  relocate(submitted_table2, .after = manuscript) |>
+  gt()
+```
+
+# Sensitivity of Model 4 to the prior for the SD of the random change-point
+
+```{r}
+ind_change <- m4_ind |>
+  filter(setting %in% c("primary", "sd10")) |>
+  select(manuscript, setting, id, cp_median) |>
+  pivot_wider(names_from = setting, values_from = cp_median) |>
+  group_by(manuscript) |>
+  summarise(max_abs_change = max(abs(sd10 - primary)), .groups = "drop")
+
+sens <- m4_pop |>
+  filter(setting %in% c("primary", "sd10")) |>
+  mutate(prior = recode(setting, primary = "Half-normal(0, 0.3)", sd10 = "Half-normal(0, 1)")) |>
+  select(manuscript, prior, cp_median, cp_lower, cp_upper, sd_cp_median, sd_cp_lower, sd_cp_upper,
+         max_rhat, min_ess_bulk, n_divergent) |>
+  left_join(ind_change, by = "manuscript") |>
+  mutate(max_abs_change = if_else(prior == "Half-normal(0, 0.3)", NA_real_, max_abs_change))
+write_csv(sens, "output/table_sensitivity.csv")
+gt(sens, groupname_col = "manuscript") |>
+  fmt_number(columns = c(cp_median, cp_lower, cp_upper, sd_cp_median, sd_cp_lower, sd_cp_upper,
+                         max_rhat, max_abs_change), decimals = 3) |>
+  fmt_number(columns = min_ess_bulk, decimals = 0)
+
+# Spread of the participant-specific change-points relative to their uncertainty (primary)
+m4_ind |> filter(setting == "primary") |>
+  group_by(manuscript) |>
+  summarise(range_of_medians = sprintf("%.2f-%.2f", min(cp_median), max(cp_median)),
+            mean_ci_width = mean(cp_upper - cp_lower), .groups = "drop") |>
+  gt() |> fmt_number(columns = mean_ci_width, decimals = 2)
+```
+
+# Figures
+
+The figures of the manuscript are saved in `figures/`.
+
+## Fig 3 (Fig 2 at submission): population-level fits
+
+All participants are shown, with a different point shape for each participant within a study (16 shapes).
+The submitted Fig 2 used the default shape palette, which has only six shapes, so the data of participants
+beyond the sixth were not drawn. The size (7 x 6 in) and font sizes are those of the submitted Fig 2.
+The Tang model (first-order approximation) is drawn at its population change-point, like the other models.
+The data for the figure are written to `figures/`, and the figure is drawn by `figures/make_fig3_actual_data.R`,
+which can also be run on its own to adjust the figure.
+
+```{r}
+#| fig-width: 7
+#| fig-height: 6
+fig2_models <- c("Model 2", "Model 3", "Tang model", "Model 4")
+model_colors <- c(model_colors, "Tang model" = "#d4a017")
+
+pop_curves <- map_dfr(seq_len(nrow(data_by_study)), function(s) {
+  d <- data_by_study$data[[s]]
+  ms <- data_by_study$manuscript[s]
+  m2 <- mixed |> filter(manuscript == ms, model == "Model 2")
+  m3 <- mixed |> filter(manuscript == ms, model == "Model 3")
+  p2 <- predict_mixed(fit_mixed_at(d, m2$cp, FALSE), d, m2$cp) |> distinct(protein, pred_fixed)
+  p3 <- predict_mixed(fit_mixed_at(d, m3$cp, TRUE), d, m3$cp) |> distinct(protein, pred_fixed)
+  p4 <- m4 |> filter(manuscript == ms, setting == "primary") |> pull(out) |> pluck(1, "curves", "population")
+  tg <- tang |> filter(manuscript == ms, approx == "FO")
+  xs <- seq(min(d$protein), max(d$protein), by = 0.01)
+  bind_rows(
+    tibble(model = "Model 2", protein = p2$protein, fit = p2$pred_fixed),
+    tibble(model = "Model 3", protein = p3$protein, fit = p3$pred_fixed),
+    tibble(model = "Tang model", protein = xs, fit = tg$b0 + tg$b1 * pmin(xs - tg$est, 0)),
+    tibble(model = "Model 4", protein = p4$protein, fit = p4$fit)
+  ) |> mutate(manuscript = ms)
+}) |>
+  mutate(model = factor(model, levels = fig2_models))
+
+cps <- bind_rows(
+  mixed |> transmute(manuscript, model, cp, lower, upper),
+  tang |> filter(approx == "FO") |> transmute(manuscript, model = "Tang model", cp = est, lower, upper),
+  m4_pop |> filter(setting == "primary") |>
+    transmute(manuscript, model = "Model 4", cp = cp_median, lower = cp_lower, upper = cp_upper)
+) |>
+  mutate(model = factor(model, levels = fig2_models))
+
+# Input of figures/make_fig3_actual_data.R, which draws and saves the figure
+dir.create("figures", showWarnings = FALSE)
+write_csv(ds |> transmute(manuscript, id = as.character(id), protein, outcome), "figures/fig3_observed.csv")
+write_csv(pop_curves |> select(manuscript, model, protein, fit), "figures/fig3_curves.csv")
+write_csv(cps |> select(manuscript, model, cp, lower, upper), "figures/fig3_changepoints.csv")
+fig3 <- local({
+  e <- new.env()
+  source("figures/make_fig3_actual_data.R", chdir = TRUE, local = e)
+  e$fig
+})
+fig3
+```
+
+## S1 Fig: participant-level fits
+
+```{r}
+#| fig-width: 7.5
+#| fig-height: 9
+s1_plots <- map(seq_len(nrow(data_by_study)), function(s) {
+  d <- data_by_study$data[[s]]
+  ms <- data_by_study$manuscript[s]
+  m2 <- mixed |> filter(manuscript == ms, model == "Model 2")
+  m3 <- mixed |> filter(manuscript == ms, model == "Model 3")
+  p2 <- predict_mixed(fit_mixed_at(d, m2$cp, FALSE), d, m2$cp)
+  p3 <- predict_mixed(fit_mixed_at(d, m3$cp, TRUE), d, m3$cp)
+  o4 <- m4 |> filter(manuscript == ms, setting == "primary") |> pull(out) |> pluck(1)
+  ind_curves <- bind_rows(
+    tibble(model = "Model 2", id = as.character(p2$id), protein = p2$protein, fit = p2$pred_ind),
+    tibble(model = "Model 3", id = as.character(p3$id), protein = p3$protein, fit = p3$pred_ind),
+    o4$curves$individual |> mutate(model = "Model 4")
+  )
+  ind_cp <- o4$ind
+  id_levels <- as.character(sort(as.integer(ind_cp$id)))
+  lab <- ind_cp |> transmute(id, strip = sprintf("ID %s (n = %d)", id, n_obs))
+  strip_map <- setNames(lab$strip, lab$id)
+  dd <- d |> mutate(id = factor(as.character(id), levels = id_levels))
+  ind_cp <- ind_cp |> mutate(id = factor(id, levels = id_levels))
+  ind_curves <- ind_curves |> mutate(id = factor(id, levels = id_levels))
+  common_cp <- tibble(model = c("Model 2", "Model 3"), cp = c(m2$cp, m3$cp))
+  ggplot() +
+    geom_vline(data = common_cp, aes(xintercept = cp, colour = model), linetype = "dashed", linewidth = 0.4,
+               show.legend = FALSE) +
+    geom_vline(data = ind_cp, aes(xintercept = cp_median), colour = model_colors["Model 4"],
+               linetype = "dashed", linewidth = 0.4) +
+    geom_line(data = dd, aes(protein, outcome), colour = "grey70", linewidth = 0.3) +
+    geom_point(data = dd, aes(protein, outcome), size = 1) +
+    geom_line(data = ind_curves, aes(protein, fit, colour = model), linewidth = 0.5) +
+    scale_colour_manual(values = model_colors, name = NULL) +
+    x_scale +
+    facet_wrap(~ id, ncol = 4, labeller = as_labeller(strip_map)) +
+    expand_limits(y = 0) +
+    labs(title = study_labels[[ms]], x = x_lab, y = y_lab) +
+    theme_bw(base_size = 10, base_family = "Arial") +
+    theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+          strip.background = element_blank(), plot.title = element_text(size = 12, face = "bold"))
+})
+walk(s1_plots, print)
+
+# S1 Fig as one PDF for A4 printing: one study per A4 portrait page, panels of the same size on
+# every page (4 columns, up to 4 rows), placed at the top of the page with 15 mm margins
+write_a4_pdf <- function(plots, file, panel_w = 1.55, panel_h = 1.4, margin = 0.6) {
+  grDevices::cairo_pdf(file, width = 8.27, height = 11.69, onefile = TRUE)
+  on.exit(grDevices::dev.off())
+  for (p in plots) {
+    grid::grid.newpage()
+    g <- ggplotGrob(p)
+    g$widths[grid::unitType(g$widths) == "null"] <- unit(panel_w, "in")
+    g$heights[grid::unitType(g$heights) == "null"] <- unit(panel_h, "in")
+    w <- grid::convertWidth(sum(g$widths), "in", valueOnly = TRUE)
+    h <- grid::convertHeight(sum(g$heights), "in", valueOnly = TRUE)
+    stopifnot(w <= 8.27 - 2 * margin, h <= 11.69 - 2 * margin)
+    grid::pushViewport(grid::viewport(y = unit(1, "npc") - unit(margin, "in"), width = unit(w, "in"),
+                                      height = unit(h, "in"), just = c("centre", "top")))
+    grid::grid.draw(g)
+    grid::popViewport()
+  }
+}
+write_a4_pdf(s1_plots, "figures/S1_Fig.pdf")
+```
+
+# Session information
+
+```{r}
+if (requireNamespace("sessioninfo", quietly = TRUE)) sessioninfo::session_info() else sessionInfo()
+```

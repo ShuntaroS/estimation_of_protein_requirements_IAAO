@@ -1,0 +1,289 @@
+---
+title: "Simulation study for the R1 revision"
+author:
+  - Shuntaro Sato
+date: now
+date-format: "YYYY/MM/DD, HH:mm"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    toc: true
+    number-sections: true
+---
+
+# Design (ADEMP)
+
+* **Aims**: to compare Models 2, 3, and 4 for estimating the population change-point (the mean of the participant-specific change-points, which corresponds to the EAR) when change-points do or do not vary among participants, and to evaluate Model 4 for the SD of the change-points and for participant-specific change-points.
+* **Data-generating mechanisms**: y = plateau + u0 + (slope + u1) × min(x − cp_i, 0) + e, with cp_i = 0.9 + u3; plateau 1.3, slope −0.8, SD(u0) = SD(u1) = SD(e) = 0.15 (based on the fits to the four datasets); protein intakes 0.1, 0.3, 0.6, 0.9, 1.2, 1.5, and 1.8 g/kg/day. Factors: SD of change-points (0, 0.1, 0.2 g/kg/day) × number of participants (8, 16) × intake levels per participant (all 7, or 4 selected at random) = 12 scenarios; 500 replicates each.
+* **Estimands**: population change-point (0.9 g/kg/day), SD of the change-points, participant-specific change-points.
+* **Methods**: as in the analysis of the published data. Models 2 and 3: REML profile over candidate change-points from 0 to 2.5 g/kg/day by 0.01, with the AIC-based 95% interval. Model 4: population change-point bounded to (0, 2.5) g/kg/day with a Normal(0, 1) prior on the logit scale; half-normal(0, 0.3) (primary) and half-normal(0, 1) priors for the SD of the change-points; 4 chains of 2000 iterations including 1000 warm-up iterations; point estimates are posterior medians and intervals are 95% equal-tailed credible intervals. Random change-point model of Tang et al. (2014) (only the change-point varies among participants): maximum likelihood with the exact likelihood (Tang (ML)) and with the first-order approximation (Tang (FO)), Wald 95% CI with t quantile (df = participants − 1), change-point restricted to (0, 2.5).
+* **Performance measures**: bias, empirical SE, RMSE, and coverage and width of the 95% intervals, with Monte Carlo SEs.
+
+```{r}
+#| output: false
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(gt)
+  library(patchwork)
+})
+source("simulation/sim_functions.R", echo = FALSE)  # for `scenarios` and `truth`
+
+results_dir <- "simulation/results"
+files <- list.files(results_dir, pattern = "^scenario_.*\\.rds$", full.names = TRUE)
+raw <- map(files, read_rds)
+stopifnot(all(map_chr(raw, ~ .x$models23_grid %||% "") == "0-2.5"), all(map_lgl(raw, ~ isTRUE(.x$tang_added))),
+          all(map_chr(raw, ~ .x$model4_point %||% "") == "median"))
+
+flatten_results <- function(x, what) {
+  map_dfr(x$results, function(r) {
+    if (!is.null(r$error)) return(NULL)
+    r[[what]] |> mutate(rep = r$rep)
+  }) |>
+    mutate(scenario = x$scenario$scenario)
+}
+
+# Models 2 and 3: a limit is missing when the AIC does not exceed its minimum by 4 within the
+# range of candidate change-points; the interval then extends to the end of the range (0 or 2.5),
+# as the credible interval of Model 4 is confined to the same range.
+cp_range <- c(0, 2.5)
+pop <- map_dfr(raw, flatten_results, what = "pop") |>
+  distinct(scenario, rep, method, .keep_all = TRUE) |>
+  left_join(scenarios, by = "scenario") |>
+  mutate(
+    m23 = method %in% c("Model 2", "Model 3"),
+    open_limit = m23 & !is.na(est) & (is.na(lower) | is.na(upper)),
+    lower = if_else(m23 & !is.na(est) & is.na(lower), cp_range[1], lower),
+    upper = if_else(m23 & !is.na(est) & is.na(upper), cp_range[2], upper),
+    no_interval = is.na(lower) | is.na(upper),
+    covered = !no_interval & lower <= truth$cp & upper >= truth$cp
+  )
+ind <- map_dfr(raw, flatten_results, what = "ind") |>
+  distinct(scenario, rep, method, id, .keep_all = TRUE) |>
+  left_join(scenarios, by = "scenario")
+n_errors <- sum(map_int(raw, ~ sum(map_lgl(.x$results, function(r) !is.null(r$error)))))
+
+scen_lab <- function(n, l) factor(sprintf("n = %d, %s", n, ifelse(l == 7, "7 levels", "4 of 7 levels")),
+                                  levels = c("n = 8, 7 levels", "n = 8, 4 of 7 levels",
+                                             "n = 16, 7 levels", "n = 16, 4 of 7 levels"))
+method_colors <- c("Model 2" = "#4269d0", "Model 3" = "#6cc5b0",
+                   "Model 4 (HN 0.3)" = "#ff725c", "Model 4 (HN 1)" = "#a0522d",
+                   "Tang (ML)" = "#9b59b6", "Tang (FO)" = "#d4a017")
+method_levels <- names(method_colors)
+dir.create("output", showWarnings = FALSE)
+```
+
+Replicates per scenario and method: `r pop |> count(scenario, method) |> pull(n) |> range() |> paste(collapse = "–")`; replicates with errors: `r n_errors`.
+
+# Population change-point
+
+```{r}
+perf_pop <- pop |>
+  group_by(scenario, sd_cp, n, levels_per_participant, method) |>
+  summarise(
+    n_rep = n(),
+    n_est = sum(!is.na(est)),
+    no_estimate = mean(is.na(est)),
+    bias = mean(est - truth$cp, na.rm = TRUE),
+    emp_se = sd(est, na.rm = TRUE),
+    rmse = sqrt(mean((est - truth$cp)^2, na.rm = TRUE)),
+    coverage = mean(covered),
+    width = mean(upper - lower, na.rm = TRUE),
+    open_limit = mean(open_limit),
+    no_interval = mean(no_interval),
+    divergent_any = mean(n_divergent > 0, na.rm = TRUE),
+    rhat_gt_1.01 = mean(max_rhat > 1.01, na.rm = TRUE),
+    secs = mean(secs, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(mcse_bias = emp_se / sqrt(n_est),
+         mcse_coverage = sqrt(coverage * (1 - coverage) / n_rep),
+         across(c(divergent_any, rhat_gt_1.01), ~ if_else(is.nan(.x), NA_real_, .x)))
+write_csv(perf_pop, "output/simulation_population.csv")
+
+# Model 4 excluding replicates with divergent transitions or R-hat > 1.01 (sensitivity check)
+perf_conv <- pop |>
+  filter(str_detect(method, "Model 4"), n_divergent == 0, max_rhat <= 1.01) |>
+  group_by(scenario, sd_cp, n, levels_per_participant, method) |>
+  summarise(n_rep = n(), bias = mean(est - truth$cp), coverage = mean(covered), .groups = "drop")
+write_csv(perf_conv, "output/simulation_population_converged.csv")
+
+# Table 3 of the manuscript (primary prior for Model 4)
+table3 <- perf_pop |>
+  filter(method %in% c("Model 2", "Model 3", "Model 4 (HN 0.3)")) |>
+  mutate(method = recode(method, "Model 4 (HN 0.3)" = "Model 4")) |>
+  select(sd_cp, n, levels_per_participant, method, bias, rmse, coverage) |>
+  pivot_wider(names_from = method, values_from = c(bias, rmse, coverage), names_glue = "{method}_{.value}") |>
+  arrange(sd_cp, n, desc(levels_per_participant))
+write_csv(table3, "output/table3_simulation.csv")
+
+# Model 4 vs the random change-point model of Tang et al. (2014)
+table_tang <- perf_pop |>
+  filter(method %in% c("Model 4 (HN 0.3)", "Tang (ML)", "Tang (FO)")) |>
+  select(sd_cp, n, levels_per_participant, method, bias, rmse, coverage, width) |>
+  pivot_wider(names_from = method, values_from = c(bias, rmse, coverage, width), names_glue = "{method}_{.value}") |>
+  arrange(sd_cp, n, desc(levels_per_participant))
+write_csv(table_tang, "output/table_simulation_tang.csv")
+
+perf_pop |>
+  mutate(design = scen_lab(n, levels_per_participant)) |>
+  select(sd_cp, design, method, n_est, no_estimate, bias, mcse_bias, emp_se, rmse, coverage, mcse_coverage,
+         width, open_limit, divergent_any, rhat_gt_1.01) |>
+  gt(groupname_col = "design") |>
+  fmt_number(columns = c(bias, mcse_bias, emp_se, rmse, width), decimals = 3) |>
+  fmt_percent(columns = c(no_estimate, coverage, mcse_coverage, open_limit, divergent_any, rhat_gt_1.01), decimals = 1)
+```
+
+For Models 2 and 3, `open_limit` is the proportion of replicates in which a limit of the interval was set to the end of the range of candidate change-points, and `no_estimate` is the proportion in which the model could not be fitted at any candidate change-point; these replicates are counted as not covering.
+
+```{r}
+#| fig-width: 7.5
+#| fig-height: 6
+fig_pop <- perf_pop |>
+  mutate(design = scen_lab(n, levels_per_participant),
+         se_bias = mcse_bias, se_cov = mcse_coverage) |>
+  pivot_longer(c(bias, coverage), names_to = "measure", values_to = "value") |>
+  mutate(se = if_else(measure == "bias", se_bias, se_cov),
+         measure = recode(measure, bias = "Bias (g/kg/day)", coverage = "Coverage of 95% interval"))
+fig_pop <- fig_pop |> mutate(method = factor(method, levels = method_levels))
+ref <- tibble(measure = c("Bias (g/kg/day)", "Coverage of 95% interval"), y = c(0, 0.95))
+p_pop <- ggplot(fig_pop, aes(factor(sd_cp), value, colour = method)) +
+  geom_hline(data = ref, aes(yintercept = y), linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(ymin = value - 1.96 * se, ymax = value + 1.96 * se),
+                  position = position_dodge(width = 0.6), size = 0.25) +
+  facet_grid(measure ~ design, scales = "free_y") +
+  scale_colour_manual(values = method_colors, name = NULL) +
+  labs(x = "SD of participant-specific change-points (g/kg/day)", y = NULL) +
+  theme_bw(base_size = 10, base_family = "Arial") +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom", strip.background = element_blank())
+p_pop
+```
+
+# SD of the participant-specific change-points (Model 4)
+
+```{r}
+perf_sd <- pop |>
+  filter(str_detect(method, "Model 4|Tang")) |>
+  group_by(sd_cp, n, levels_per_participant, method) |>
+  summarise(
+    n_rep = sum(!is.na(sd_cp_est)),
+    mean_posterior_median = mean(sd_cp_est, na.rm = TRUE),
+    bias = mean(sd_cp_est - sd_cp, na.rm = TRUE),
+    coverage = if (first(sd_cp) > 0 && str_detect(first(method), "Model 4")) mean(sd_cp_lower <= sd_cp & sd_cp_upper >= sd_cp, na.rm = TRUE) else NA_real_,
+    mean_upper = if (str_detect(first(method), "Model 4")) mean(sd_cp_upper, na.rm = TRUE) else NA_real_,
+    .groups = "drop"
+  )
+write_csv(perf_sd, "output/simulation_sd_cp.csv")
+perf_sd |>
+  mutate(design = scen_lab(n, levels_per_participant)) |>
+  select(-n, -levels_per_participant) |>
+  gt(groupname_col = "design") |>
+  fmt_number(columns = c(mean_posterior_median, bias, mean_upper), decimals = 3) |>
+  fmt_percent(columns = coverage, decimals = 1)
+```
+
+Coverage is not reported when the true SD is 0 (boundary of the parameter space).
+
+# Participant-specific change-points
+
+Models 2 and 3 assign the common change-point to every participant.
+
+```{r}
+perf_ind <- ind |>
+  group_by(sd_cp, n, levels_per_participant, method) |>
+  summarise(
+    rmse = sqrt(mean((est - true_cp)^2, na.rm = TRUE)),
+    coverage = mean(lower <= true_cp & upper >= true_cp, na.rm = TRUE),
+    width = mean(upper - lower, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(across(c(coverage, width), ~ if_else(is.nan(.x), NA_real_, .x)))
+write_csv(perf_ind, "output/simulation_individual.csv")
+perf_ind |>
+  mutate(design = scen_lab(n, levels_per_participant)) |>
+  select(-n, -levels_per_participant) |>
+  gt(groupname_col = "design") |>
+  fmt_number(columns = c(rmse, width), decimals = 3) |>
+  fmt_percent(columns = coverage, decimals = 1)
+```
+
+## By the number of a participant's intake levels below the true change-point (Model 4, SD of change-points > 0)
+
+```{r}
+perf_ind_below <- ind |>
+  filter(str_detect(method, "Model 4|Tang"), sd_cp > 0) |>
+  mutate(levels_below = case_when(n_below_true == 0 ~ "0", n_below_true == 1 ~ "1",
+                                  n_below_true == 2 ~ "2", TRUE ~ "3+")) |>
+  group_by(method, levels_per_participant, levels_below) |>
+  summarise(n_participants = n(),
+            rmse = sqrt(mean((est - true_cp)^2)),
+            coverage = mean(lower <= true_cp & upper >= true_cp),
+            width = mean(upper - lower),
+            .groups = "drop")
+write_csv(perf_ind_below, "output/simulation_individual_by_levels_below.csv")
+perf_ind_below |>
+  gt(groupname_col = "method") |>
+  fmt_number(columns = c(rmse, width), decimals = 3) |>
+  fmt_percent(columns = coverage, decimals = 1)
+```
+
+```{r}
+#| fig-width: 7.5
+#| fig-height: 7
+p_ind <- perf_ind |>
+  mutate(design = scen_lab(n, levels_per_participant)) |>
+  ggplot(aes(factor(sd_cp), rmse, colour = method, group = method)) +
+  geom_point(position = position_dodge(width = 0.6), size = 1.8) +
+  facet_wrap(~ design, nrow = 1) +
+  scale_colour_manual(values = method_colors, name = NULL) +
+  expand_limits(y = 0) +
+  labs(x = "SD of participant-specific change-points (g/kg/day)",
+       y = "RMSE of participant-specific\nchange-points (g/kg/day)") +
+  theme_bw(base_size = 10, base_family = "Arial") +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom", strip.background = element_blank())
+below_plot <- perf_ind_below |>
+  filter(n_participants >= 30) |>
+  mutate(design = factor(if_else(levels_per_participant == 7, "7 levels per participant", "4 of 7 levels per participant"),
+                         levels = c("7 levels per participant", "4 of 7 levels per participant")))
+p_below <- ggplot(below_plot, aes(levels_below, rmse, colour = method, group = method)) +
+  geom_point(position = position_dodge(width = 0.4), size = 1.8) +
+  geom_line(position = position_dodge(width = 0.4), linewidth = 0.4) +
+  facet_wrap(~ design, nrow = 1, scales = "free_x") +
+  scale_colour_manual(values = method_colors, name = NULL) +
+  expand_limits(y = 0) +
+  labs(x = "Intake levels below the participant's true change-point",
+       y = "RMSE of participant-specific\nchange-points (g/kg/day)") +
+  theme_bw(base_size = 10, base_family = "Arial") +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom", strip.background = element_blank())
+p_fig4 <- (p_ind / p_below) + plot_layout(heights = c(1, 0.85)) + plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold"))
+p_fig4
+```
+
+# Fig 2 of the manuscript
+
+The figures above are for checking. Fig 2 of the manuscript is drawn by `figures/make_fig2_simulation.R`
+from the performance measures of the population-level change-point written below; the script can also be
+run on its own to adjust the figure.
+
+```{r}
+#| fig-width: 7.5
+#| fig-height: 6.5
+dir.create("figures", showWarnings = FALSE)
+perf_pop |>
+  select(scenario, sd_cp, n, levels_per_participant, method, n_rep, n_est, bias, mcse_bias, emp_se, rmse,
+         coverage, mcse_coverage, width, no_interval) |>
+  write_csv("figures/sim_performance_population.csv")
+fig2 <- local({
+  e <- new.env()
+  source("figures/make_fig2_simulation.R", chdir = TRUE, local = e)
+  e$fig
+})
+fig2
+```
+
+# Session information
+
+```{r}
+if (requireNamespace("sessioninfo", quietly = TRUE)) sessioninfo::session_info() else sessionInfo()
+```
